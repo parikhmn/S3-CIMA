@@ -41,13 +41,51 @@ def run_s3cima(
     seed: int = 420,
     save_path: str = ".",
     ):  
-    """Runs an S3-CIMA analysis TODO
+    """Runs an S3-CIMA analysis end to end.
+
+    Pipeline
+    --------
+    1. Build neighbourhoods around anchor cells   (CIMADataset)
+    2. Split patients, train `nruns` CellCNN runs,
+       pool + cluster filters into consensus filters,
+       rank discriminative filters               (utils.model.fit)
+    3. Heatmap of consensus filter weights        (plot_filter_weights)
+    4. Score neighbourhoods with each reported filter and mark the top
+       (1 - filter_threshold) as "selected", for the test patients and for
+       all non-test patients                      (get_high_response_cells_*)
+    5. Save selected cells, spatial plots and enrichment reports
+                                                  (save_stats, enrichment_summary)
 
     Args
     ----
+    anchor            : cell type used as neighbourhood centre, or "BG" for
+                        random centres (global analysis)
+    image_id, sample_id, intensity, genes, cell_type, x, y, cell_id, label,
+    label_map         : arrays returned by utils.preprocess.process_csv
+    K                 : number of nearest neighbours per anchor
+    ncell             : number of the K neighbours randomly kept (<= K)
+    random_ctrl       : add a "background" class of random non-anchor
+                        neighbourhoods (ignored when anchor == "BG").
+                        Recommended for anchored runs: it is the only way the
+                        package tests anchor specificity.
+    task              : only "classification" is implemented
+    nruns             : number of independent training runs
+    dendrogram_cutoff : cosine-distance cut for clustering filters
+    n_val_folds       : number of patient-level train/validation folds
+    maxpool_percentages: pooling sizes, % of ncell, cycled through by run
+    nfilter_selection : candidate numbers of filters, drawn per run
+    filter_threshold  : quantile above which neighbourhoods are "selected"
+                        (0.9 = top 10%)
+    dropout, dropout_p, bg_sets, batch_size, lr, l2, epochs, num_workers,
+    early_stopping, patience : training settings (lr default here is 0.1,
+                        whereas fit() defaults to 0.01)
+    seed              : global seed; also decides which patients form the test set
+    save_path         : directory for the timestamped results folder
 
     Returns
     -------
+    None. All outputs are written to disk under
+    <save_path>/results_Anchor<anchor>_K<K>_<date>_<time>/.
     """
     # Set seed
     set_seed(seed)
@@ -79,6 +117,8 @@ def run_s3cima(
         genes = genes,
         n_val_folds=n_val_folds,
         nruns=nruns,
+        # NOTE: fit() uses dataset.random_ctrl (the effective value) for the
+        # background logic, since the dataset overrides it for "BG" (FIX-4).
         background=random_ctrl,
         batch_size = batch_size,
         lr = lr,
@@ -96,6 +136,7 @@ def run_s3cima(
         seed=seed)
     
     # Calculate cell filter response - results is the final metadata dict
+    # (list of the up-to-4 consensus filters chosen for reporting)
     fig_save_path = s3cima_plot.plot_filter_weights(results,
                                     show=False, 
                                     save_path=res_save_path)   
@@ -108,7 +149,11 @@ def run_s3cima(
                                               genes, 
                                               filter_threshold=filter_threshold)
     
-    # Calculate enrichment and plots
+    # Calculate enrichment and plots.
+    # test/  : held-out patients (also used to rank which filters are
+    #          reported, so read them as a generalisation check of the chosen
+    #          filters rather than an untouched estimate)
+    # train/ : all non-test patients
     test_fig_save_path = s3cima_plot.save_stats(res_test,
                                     x, y, cell_id, cell_type, sample_id, label, label_map,
                                     save_path = fig_save_path,

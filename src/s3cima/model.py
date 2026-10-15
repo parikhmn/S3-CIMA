@@ -14,6 +14,28 @@ class CellCNN(nn.Module):
     """
     PyTorch reimplementation of CellCNN (single time-point).
 
+    Architecture (one forward pass for a batch of neighbourhoods)
+    -------------------------------------------------------------
+        input          (B, ncell, nmark)   z-scored marker values
+        1x1 conv       (B, nfilter, ncell) each filter scores each cell:
+                                           ReLU(w · x_cell + bias)
+        top-k pooling  (B, nfilter)        mean of the k highest cell scores
+        dropout        (B, nfilter)        training only
+        linear layer   (B, n_classes)      combines filters into class logits
+
+    A filter is a weight vector over ALL markers (a learned "cell
+    signature"). The 1x1 convolution applies the same filter to every cell
+    independently, and pooling makes the model invariant to the order of
+    cells, so a neighbourhood is treated as an unordered bag of cells.
+
+    The model is deliberately tiny (nmark*nfilter + nfilter weights in the
+    filters, nfilter*n_classes + n_classes in the output layer), which is
+    what keeps the filters interpretable.
+
+    Choice of k:
+      - k = 1     : "is there at least one cell like this?" (rare cells)
+      - k = ncell : "how much of the neighbourhood looks like this?"
+
     Parameters
     ----------
     nmark          : int   — number of input markers (features per cell)
@@ -42,6 +64,8 @@ class CellCNN(nn.Module):
         self.regression = regression
         self.selection_type = selection_type
 
+        # kernel_size=1 => each filter is applied to one cell at a time; the
+        # conv weight of shape (nfilter, nmark, 1) holds the filter signatures
         self.conv = nn.Conv1d(
             in_channels = nmark,
             out_channels = nfilter,
@@ -67,12 +91,18 @@ class CellCNN(nn.Module):
         -------
         (B, n_classes) logits or (B, 1) for regression
         """
-        x = x.permute(0, 2, 1)                  
-        x = F.relu(self.conv(x))                 
-        x = select_top_pool(x, self.k, self.selection_type)  
+        # Conv1d expects channels first: (B, nmark, ncell)
+        x = x.permute(0, 2, 1)
+        # Per-cell filter responses, negatives clipped to 0: (B, nfilter, ncell)
+        x = F.relu(self.conv(x))
+        # One value per filter per neighbourhood: (B, nfilter)
+        x = select_top_pool(x, self.k, self.selection_type)
+        # Randomly zero pooled filter values during training so the model
+        # cannot rely on a single filter
         if self.dropout is not None:
             x = self.dropout(x)
-        return self.fc(x)                       
+        # Class logits (or a single regression output)
+        return self.fc(x)
     
 
 def select_top_pool(x: torch.Tensor, k: int, selection_type: str = "mean") -> torch.Tensor:
