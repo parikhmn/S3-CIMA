@@ -1,4 +1,9 @@
-"""Generic utils for S3-CIMA"""
+"""Generic utils for S3-CIMA
+
+Input preparation: load the marker and metadata CSVs, run sanity checks, drop
+unwanted cell types, and return the plain numpy arrays expected by
+``run_s3cima`` (intensity matrix, coordinates, IDs, integer labels).
+"""
 
 # Imports
 
@@ -30,6 +35,19 @@ def check_cima_input_csv(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Validate and clean input DataFrames for the S3-CIMA pipeline.
+
+    Checks performed
+    ----------------
+    1. meta and markers have the same number of rows (row i = same cell).
+    2. All required metadata columns exist.
+    3. Rows with a NaN in either table are dropped from BOTH tables.
+    4. Value-range sanity check of the marker matrix. The checks assume
+       log-normalised RNA counts (non-negative, max <= 30). For protein
+       data (e.g. arcsinh-transformed intensities) these warnings can be
+       expected and are harmless: the pipeline z-scores every marker
+       internally before training.
+    5. Every cell type in filter_cell_types exists in the data. (The actual
+       removal is done in process_csv.)
 
     Returns
     -------
@@ -150,7 +168,15 @@ def process_csv(
     sample_id_col     : column name for patient/sample ID
     image_id_col      : column name for image/FOV ID
     condition_col     : column name for condition/phenotype label
-    filter_cell_types : optional list of cell types to retain; None keeps all
+    filter_cell_types : optional list of cell types to REMOVE from the
+                        analysis (e.g. unassigned / artefact classes);
+                        None keeps all cell types
+
+                        [FIX-5] This line previously read "optional list of
+                        cell types to retain; None keeps all", but the code
+                        (`~meta[cell_type_col].isin(filter_cell_types)`)
+                        REMOVES the listed types. The code behaviour is kept
+                        and the documentation corrected.
 
     Returns
     -------
@@ -162,7 +188,11 @@ def process_csv(
     cell_type   : np.ndarray, shape (N,)  — cell type labels
     sample_id   : np.ndarray, shape (N,)  — sample/patient IDs
     image_id    : np.ndarray, shape (N,)  — image IDs
-    condition   : np.ndarray, shape (N,)  — condition labels
+    condition   : np.ndarray, shape (N,)  — integer-encoded condition labels
+                                            (0..C-1, alphabetical order of the
+                                            original condition strings)
+    mapping     : dict {int: str}         — maps the integer labels back to
+                                            the original condition names
     """
     import os
 
@@ -187,7 +217,7 @@ def process_csv(
         filter_cell_types = filter_cell_types,
     )
  
-    # Filter if specified
+    # Filter if specified: the listed cell types are REMOVED (see [FIX-5])
     if filter_cell_types is not None:
         n_before = len(meta)
         mask = ~meta[cell_type_col].isin(filter_cell_types)
@@ -208,6 +238,9 @@ def process_csv(
     sample_id = meta[sample_id_col].values.astype(str)
     image_id = meta[image_id_col].values.astype(str)
 
+    # Encode condition strings as integers 0..C-1 (LabelEncoder sorts the
+    # classes alphabetically). The model needs integer class indices; the
+    # mapping is returned so outputs can be translated back to names.
     condition = meta[condition_col].values.astype(str)
     encoder = LabelEncoder()
     integer_labels = encoder.fit_transform(condition)

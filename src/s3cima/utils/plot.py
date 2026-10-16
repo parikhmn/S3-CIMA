@@ -1,4 +1,25 @@
-"""Plotting functions to for the S3-CIMA model outputs"""
+"""Plotting functions to for the S3-CIMA model outputs
+
+What this module produces (called from run_s3cima)
+--------------------------------------------------
+1. plot_filter_weights           -> plots/consensus_filter_weights.html
+       heatmap of marker weights for the reported consensus filters.
+2. get_high_response_cells_test / _train
+       score every non-background neighbourhood with each reported filter
+       and mark the top (1 - filter_threshold) fraction as "selected".
+3. save_stats                    -> plots/{test,train}/filter_<id>/
+       all_selected_cells.csv and spatial_plot_sample_<id>.png per sample.
+4. enrichment_summary            -> cell_type_proportions.png per filter and
+       enrichment_summary_report_{test,train}.html.
+
+IMPORTANT: "selected" is a NEIGHBOURHOOD-level property
+---------------------------------------------------------
+A cell is "selected" when it belongs to at least one high-scoring
+neighbourhood. This is not the paper's per-cell definition, where each cell
+is scored by the filter individually. The selected-cell outputs therefore
+describe what SURROUNDS high-scoring anchors, not a molecularly defined
+subset of cells. Counts come in multiples of ncell for this reason.
+"""
 
 # Imports
 
@@ -27,10 +48,25 @@ def plot_filter_weights(
     """
     Plot a heatmap of gene weights across all filter clusters.
 
+    Rows = consensus filters (medoid of each cluster), columns = markers,
+    colour = weight. Markers are ordered by their largest |weight|.
+
+    How to read it
+    --------------
+    - Weights act on Z-SCORED marker values. A positive (red) weight means
+      above-average values of the marker raise the filter's response. A
+      negative (blue) weight means above-average values lower it, or
+      equivalently that LOW values of the marker raise it. The title's
+      "activating / suppressing" wording is a simplification.
+    - Colour intensity is not importance: a weight only matters if the
+      marker actually varies across cells. Large weights on rarely detected
+      markers barely move from their random initialisation.
+
     Parameters
     ----------
-    meta        : list of dicts — the 'meta' key from extract_and_save_filters output.
-                  Each dict must contain 'cluster', 'dominant_class', 'all_gene_weights'.
+    meta        : list of dicts — the 'meta' key from get_discriminative_filters
+                  output (as filtered by fit()). Each dict must contain
+                  'cluster', 'filter_diff' and 'all_gene_weights'.
     save_path   : str  — directory to save the HTML (and PNG) file.
     filename    : str  — base filename without extension.
     show        : bool — if True, calls fig.show() to display in browser/notebook.
@@ -130,12 +166,26 @@ def get_high_response_cells_test(
     the filter_threshold quantile, and return the cell IDs of the
     high-responding neighbourhoods.
 
+    How the neighbourhood score is computed (and how it differs from the model)
+    -------------------------------------------------------------------------
+        score = mean over the top ntop cells of ReLU(x_cell · w)
+
+    This intentionally simplified score differs from the trained model in
+    two ways. It is documented here, not changed:
+      - the filter's BIAS term is not added;
+      - pooling uses m.get("maxpool_percentage", 100). The metadata does not
+        contain that key, so ntop = all cells (plain averaging), whatever
+        top-k pooling the source model was trained with.
+    A neighbourhood is "selected" if its score is at or above the
+    `filter_threshold` quantile of all scores. Scores are pooled across
+    BOTH conditions, so the top 10% may come mostly from one condition.
+
     Parameters
     ----------
-    meta             : list of dicts — 'meta' key from extract_and_save_filters.
+    meta             : list of dicts — 'meta' key from get_discriminative_filters.
                        Each dict must contain 'all_gene_weights', 'cluster',
-                       'dominant_class'. Optionally 'maxpool_percentage'.
-    dataset          : NormalizedCIMASubset — samples must be
+                       'filter_diff'. Optionally 'maxpool_percentage'.
+    dataset          : NormalizedCIMASubset (z-scored test set) — samples must be
                        dicts with keys 'intensity', 'is_ctrl', 'cellids'.
     genes            : list of str — marker names in the same order as the
                        intensity columns used during training.
@@ -206,13 +256,14 @@ def get_high_response_cells_test(
         )
 
         # Compute pooled ReLU activation for each neighbourhood
+        # (simplified score: no bias term, ntop = all cells — see docstring)
         responses = np.zeros(len(anchor_intensities), dtype=np.float32)
         for i, x in enumerate(anchor_intensities):
-            g  = np.maximum(0.0, x @ conv_w)
+            g  = np.maximum(0.0, x @ conv_w)          # per-cell response (ncell,)
             ntop = max(1, int(ntop_frac * x.shape[0]))
             responses[i]  = np.mean(np.sort(g)[-ntop:])
 
-        # Collect responsive cell IDs
+        # Collect responsive cell IDs: neighbourhoods at/above the quantile
         threshold_val = float(np.quantile(responses, filter_threshold))
         high_idx = np.where(responses >= threshold_val)[0]
 
@@ -253,15 +304,20 @@ def get_high_response_cells_train(
 ) -> dict:
     """
     For each consensus filter cluster, compute the pooled filter response
-    for every non-background neighbourhood in the whole dataset, threshold at
-    the filter_threshold quantile, and return the cell IDs of the
-    high-responding neighbourhoods.
+    for every non-background neighbourhood in all NON-TEST patients,
+    threshold at the filter_threshold quantile, and return the cell IDs of
+    the high-responding neighbourhoods.
+
+    Only the first fold is read, but its train + validation subsets together
+    contain every non-test patient, so this covers the whole non-test cohort.
+    The scoring is the same simplified score as in
+    get_high_response_cells_test (no bias term, average over all cells).
 
     Parameters
     ----------
-    meta             : list of dicts — 'meta' key from extract_and_save_filters.
+    meta             : list of dicts — 'meta' key from get_discriminative_filters.
                        Each dict must contain 'all_gene_weights', 'cluster',
-                       'dominant_class'. Optionally 'maxpool_percentage'.
+                       'filter_diff'. Optionally 'maxpool_percentage'.
     validation_splits: list of tuples — each tuple contains (train_subset, val_subset)
     genes            : list of str — marker names in the same order as the
                        intensity columns used during training.
@@ -336,6 +392,7 @@ def get_high_response_cells_train(
         )  # (nmark,)
 
         # Compute pooled ReLU activation for each neighbourhood
+        # (simplified score: no bias term, ntop = all cells — see docstring)
         responses = np.zeros(len(anchor_intensities), dtype=np.float32)
         for i, x in enumerate(anchor_intensities):
             g             = np.maximum(0.0, x @ conv_w)       # (ncell,)
@@ -390,8 +447,17 @@ def save_stats(
     For each consensus filter cluster:
       - Per sample : spatial .png named by sample ID
       - Per filter : all_selected_cells.csv — x, y, cell_id, cell_type,
-                     sample_id, label, cluster_id, filter_diff
+                     condition_id, sample_id, cluster_id, filter_diff
                      for every high-response cell across all samples
+
+    Samples with no selected cell are skipped (no plot, no CSV rows). The
+    spatial plots show selected cells in dark red over all other cells of
+    the sample in grey, at their original x/y positions.
+
+    These CSVs are the starting point for downstream statistics the package
+    does not compute itself, e.g. per-patient fraction of selected cells by
+    condition (Wilcoxon test) or marker comparisons between selected and
+    non-selected cells of the same type (KS statistic), as in the paper.
 
     Parameters
     ----------
@@ -532,6 +598,30 @@ def enrichment_summary(
 
     TODO - this function is a bit messy
 
+    What the enrichment value means
+    -------------------------------
+    For each sample with at least one selected cell, and each cell type T:
+
+        log2( (prop. of T among SELECTED cells + p)
+              / (prop. of T among NON-selected cells of the same sample + p) )
+
+    with pseudocount p = 1 / n_cells_in_sample. The report shows the mean ±
+    SD of this value across samples.
+
+    This is NOT the enrichment score (ES) of the S3-CIMA paper, which
+    compares a type's presence among selected cells near anchors to what is
+    expected from overall abundance. This report answers: "which cell types
+    are over-represented in the top-scoring neighbourhoods compared with
+    the rest of the same tissue?"
+
+    Caveats:
+      - samples with no selected cells are left out entirely;
+      - with a single contributing sample the SD is undefined and shown as 0;
+      - rare cell types (a handful of cells) can produce large values.
+
+    "majority condition" = the condition contributing >= 90% of selected
+    cells, otherwise "mixed".
+
     Parameters
     ----------
     save_path   : str         — root directory passed to save_high_response_stats
@@ -607,7 +697,8 @@ def enrichment_summary(
         ct_props.columns = ["cell_type", "proportion"]
         ct_props = ct_props.sort_values("proportion", ascending=False)
 
-        # Per-sample log2 enrichment
+        # Per-sample log2 enrichment: selected vs. non-selected cells of the
+        # SAME sample (background = all other cells in that sample)
         enrichment_rows = []
         for sid, sid_df in df.groupby("sample_id"):
             # String conversion due to CSV saving
@@ -784,6 +875,9 @@ def enrichment_summary(
 
 
 # Archived functions ---------------------------------------------------------
+# The functions below are no longer called by run_s3cima. They are kept for
+# reference (older output layout: one folder per sample with per-sample
+# enrichment CSVs).
 
 def save_high_response_stats(
     high_response: dict,
